@@ -2,7 +2,7 @@
 
 Capa de software para la **auditoría hídrica** y la **visualización del estado del suelo** de un sistema de riego ya instalado. Práctica Profesionalizante I (ISPC, 2026) — Evidencia 3.
 
-**Aplicación publicada:** `PEGAR_AQUI_EL_LINK_DE_STREAMLIT`
+**Aplicación publicada:** (https://riego-inteligente-ispc.streamlit.app/)
 
 El tablero procesa telemetría real de un cultivo de frutilla en Paraguay (julio a septiembre de 2022). No está conectado a un campo en vivo y no acciona válvulas.
 
