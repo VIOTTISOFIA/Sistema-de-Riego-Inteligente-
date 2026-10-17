@@ -53,7 +53,8 @@ SITUACIONES = {
     "Una mañana normal": pd.Timestamp("2022-08-16 07:00"),
     "Riego en marcha": pd.Timestamp("2022-08-14 18:00"),
     "Hay que regar": pd.Timestamp("2022-09-16 12:40"),
-    "Riego abierto sin agua": pd.Timestamp("2022-09-01 21:50"),
+    "Riego abierto sin agua": pd.Timestamp("2022-09-04 08:00"),
+    "Riego con muy poca agua": pd.Timestamp("2022-09-01 21:50"),
     "Agua que sale sin orden": pd.Timestamp("2022-08-03 07:00"),
 }
 
@@ -140,6 +141,11 @@ except etl.DatosInvalidos as e:
     st.stop()
 
 eventos = cargar_eventos()
+
+
+@st.cache_data(max_entries=64)
+def eventos_hasta(i: int) -> pd.DataFrame:
+    return etl.eventos_riego(cargar_datos().iloc[: i + 1])
 RIEGO_TIPICO = etl.riego_tipico(eventos)
 T_MIN, T_MAX = df["ts_local"].iloc[300].ceil("h"), df["ts_local"].iloc[-1]
 
@@ -201,7 +207,9 @@ if vista != VISTAS[0]:
 # "Ahora": todo el producto ve solo lo ocurrido hasta este momento
 I = posicion(ss.ahora)
 hist = df.iloc[: I + 1]
-ev_hist = eventos[eventos["inicio"] <= hist["ts_local"].iloc[-1]]
+# DEF-16: los riegos se arman sobre el historico recortado, asi una orden en curso
+# muestra solo lo ocurrido hasta "ahora" en todas las pantallas
+ev_hist = eventos_hasta(I)
 S = etl.situacion_actual(df, I, ss.umbral_accion)
 AHORA = S["ts"]
 
@@ -230,11 +238,11 @@ def grafico_humedad(ventana: pd.DataFrame, ev: pd.DataFrame, umbral: float):
     ordenes = ev[(ev["fin"] >= t0) & (ev["inicio"] <= t1)].copy()
     ordenes["desde"] = ordenes["inicio"].clip(lower=t0)
     ordenes["hasta"] = (ordenes["fin"] + pd.Timedelta(minutes=5)).clip(upper=t1)
-    ordenes["Riego"] = ordenes["sin_caudal"].map({True: "Sin agua", False: "Con agua"})
+    ordenes["Riego"] = ordenes["sin_caudal"].map({True: "Con problemas", False: "Con agua"})
     franjas = alt.Chart(ordenes).mark_rect(opacity=0.3).encode(
         x=alt.X("desde:T", scale=dominio), x2="hasta:T",
         color=alt.Color("Riego:N",
-                        scale=alt.Scale(domain=["Con agua", "Sin agua"],
+                        scale=alt.Scale(domain=["Con agua", "Con problemas"],
                                         range=[AGUA, ROJO]),
                         legend=alt.Legend(orient="bottom", title="Riegos")),
         tooltip=[alt.Tooltip("inicio:T", format="%d/%m %H:%M", title="Inicio"),
@@ -280,9 +288,11 @@ def vista_hoy():
         estado = etl.clasificar(p, ss.umbral_accion, ss.umbral_holgura)[0]
         st.markdown(barra_humedad(p, ss.umbral_accion, ss.umbral_holgura),
                     unsafe_allow_html=True)
+        previa = (f' · última lectura {hace(S["min_sin_humedad"])}'
+                  if S["min_sin_humedad"] > 0 else "")
         st.markdown(f'<div class="tecnico">Estado: {estado} · P{p:.0f} de la serie del '
                     f'sensor · lectura {S["humedad"]:.2f} %'.replace(".", ",")
-                    + ' · regar por debajo de P' + f'{ss.umbral_accion}</div>',
+                    + ' · regar por debajo de P' + f'{ss.umbral_accion}{previa}</div>',
                     unsafe_allow_html=True)
 
     # ---- Riego y agua: dos comprobaciones en lenguaje llano ----
@@ -298,8 +308,10 @@ def vista_hoy():
         minutos = (AHORA - u["fin"]).total_seconds() / 60
         if u["sin_caudal"]:
             riego = fila(ROJO, "Riego cerrado",
-                         f"El último riego fue {hace(minutos)} y no entregó agua "
-                         f"({duracion(u['dur_min'])} abierto, {litros(u['litros'])}).")
+                         f"El último riego fue {hace(minutos)} y "
+                         + ("no entregó agua " if u["resultado"] == "Sin agua"
+                            else "entregó muy poca agua ")
+                         + f"({duracion(u['dur_min'])} abierto, {litros(u['litros'])}).")
         else:
             riego = fila(HOJA, "Riego cerrado",
                          f"Último riego {hace(minutos)}: {duracion(u['dur_min'])}, "
@@ -408,16 +420,21 @@ def vista_agua():
                      [["inicio", "dur_min", "litros"]].head(10),
                      hide_index=True, column_config=columnas)
 
-    st.subheader("Riegos que no entregaron agua")
+    st.subheader("Riegos sin agua o con caudal insuficiente")
     sin = etl.ordenes_sin_caudal(ev)
     if sin.empty:
         st.markdown("Todos los riegos del período entregaron agua.")
     else:
-        st.caption(f"{len(sin)} de {len(ev)} riegos. El riego figuró abierto "
-                   f"{duracion(sin['dur_min'].sum())} en total sin que pasara agua.")
+        nada = int((sin["resultado"] == "Sin agua").sum())
+        st.caption(f"{len(sin)} de {len(ev)} riegos: {nada} sin agua y {len(sin) - nada} "
+                   f"con caudal insuficiente (menos de "
+                   f"{str(etl.CAUDAL_MINIMO_L_MIN).replace('.', ',')} L por minuto; "
+                   f"un riego normal ronda los 16). En total, "
+                   f"{duracion(sin['dur_min'].sum())} de riego abierto.")
         st.dataframe(sin.sort_values("dur_min", ascending=False)
-                     [["inicio", "dur_min", "litros"]],
-                     hide_index=True, column_config=columnas)
+                     [["inicio", "dur_min", "litros", "resultado"]],
+                     hide_index=True,
+                     column_config={**columnas, "resultado": "Resultado"})
 
     st.download_button("Descargar el detalle diario", diario.round(1).to_csv().encode("utf-8"),
                        file_name="agua_por_dia.csv", mime="text/csv")
@@ -432,7 +449,7 @@ def vista_riegos():
     desde = AHORA - pd.Timedelta(days=30)
     ev = ev_hist[ev_hist["inicio"] >= desde]
     st.caption("Últimos 30 días.")
-    solo = st.toggle("Ver solo los que no entregaron agua")
+    solo = st.toggle("Ver solo los riegos con problemas de caudal")
     if solo:
         ev = ev[ev["sin_caudal"]]
     if ev.empty:
@@ -445,7 +462,7 @@ def vista_riegos():
     c3.metric("Duración habitual", duracion(ev["dur_min"].median()))
 
     tabla = ev.sort_values("inicio", ascending=False).assign(
-        resultado=lambda d: d["sin_caudal"].map({True: "Sin agua", False: "Correcto"}))
+        resultado=lambda d: d["resultado"])
     st.dataframe(
         tabla[["inicio", "dur_min", "litros", "percentil_inicial", "resultado"]],
         hide_index=True, height=480,

@@ -39,6 +39,7 @@ def test_la_app_abre_en_hoy_con_una_respuesta():
     ("Riego en marcha", "Regando"),
     ("Hay que regar", "Hay que regar"),
     ("Riego abierto sin agua", "El riego está abierto, pero no llega agua"),
+    ("Riego con muy poca agua", "El riego está abierto, pero llega muy poca agua"),
     ("Agua que sale sin orden", "Fuga / Agua no atribuida")])
 def test_cada_situacion_muestra_su_mensaje(situacion, titular):
     assert titular in textos(abrir(situacion=situacion))
@@ -54,7 +55,7 @@ def test_mover_la_fecha_cambia_la_pantalla():
     at.sidebar.slider[0].set_value(dt.datetime(2022, 9, 1, 21, 30)).run()
     assert not at.exception
     assert "Jueves 01/09/2022" in textos(at)
-    assert "no llega agua" in textos(at)
+    assert "llega muy poca agua" in textos(at)       # DEF-11: 63 L no es "sin agua"
 
 
 def test_avanzar_el_tiempo_actualiza_solo_y_se_detiene_al_final():
@@ -66,11 +67,24 @@ def test_avanzar_el_tiempo_actualiza_solo_y_se_detiene_al_final():
     assert "Viernes 16/09/2022, 20:00 h" in textos(at)
 
 
-def test_sin_lectura_de_humedad_no_rompe():
+def test_una_lectura_faltante_usa_la_ultima_valida():
+    """DEF-10: el sensor reporta cada ~20 min; una falta puntual no es un corte."""
     at = abrir()
     at.sidebar.slider[0].set_value(dt.datetime(2022, 7, 14, 19, 30)).run()
     assert not at.exception
-    assert "No hay lectura del suelo" in textos(at)
+    t = textos(at)
+    assert "No hay lectura del suelo" not in t
+    assert "No hace falta regar" in t and "última lectura hace 5 min" in t
+
+
+def test_riegos_muestran_solo_hasta_ahora():
+    """DEF-16: una orden en curso no puede mostrar datos posteriores a "ahora"."""
+    at = abrir("Riegos")
+    at.sidebar.slider[0].set_value(dt.datetime(2022, 8, 30, 12, 0)).run()
+    tabla = at.dataframe[0].value
+    fila = tabla[tabla["inicio"].dt.strftime("%d/%m %H:%M") == "29/08 00:45"].iloc[0]
+    assert fila["dur_min"] == 2085 and round(fila["litros"]) == 61
+    assert fila["resultado"] == "Caudal insuficiente"
 
 
 def test_agua_muestra_solo_lo_ocurrido_hasta_ahora():

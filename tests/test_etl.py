@@ -154,8 +154,9 @@ def test_semaforo(percentil, esperado):
 # ---------- Entradas invalidas ----------
 
 def test_archivo_faltante(tmp_path):
-    with pytest.raises(etl.DatosInvalidos, match="No se encontro"):
+    with pytest.raises(etl.DatosInvalidos, match="No se encontró") as e:
         etl.ejecutar_etl(tmp_path)
+    assert str(tmp_path) not in str(e.value)        # DEF-13: sin ruta del servidor
 
 
 def test_columnas_incorrectas(tmp_path):
@@ -176,7 +177,9 @@ def test_fecha_con_formato_inesperado(tmp_path):
     (200, "No hace falta regar", []),
     (9176, "Todavía no hace falta regar", []),
     (5471, "No hace falta regar", ["Fuga / Agua no atribuida"]),
-    (13920, "El riego está abierto, pero no llega agua",
+    (13920, "El riego está abierto, pero llega muy poca agua",
+     ["Orden de riego emitida sin caudal detectado"]),
+    (14609, "El riego está abierto, pero no llega agua",
      ["Orden de riego emitida sin caudal detectado"]),
     (17340, "Hay que regar", ["Riego necesario"])])
 def test_titular_y_avisos_en_momentos_conocidos(df, posicion, titulo, avisos):
@@ -199,3 +202,37 @@ def test_la_orden_en_curso_acumula_desde_su_inicio(df):
 def test_la_serie_horaria_conserva_el_total(df):
     h = etl.serie_horaria(df)
     assert h["litros"].sum() == pytest.approx(etl.resumen_auditoria(df)["medido"])
+
+
+# ---------- Correcciones de la Evidencia 3 de Testing ----------
+
+def test_resultado_distingue_sin_agua_de_caudal_insuficiente(df):
+    """DEF-11"""
+    ev = etl.eventos_riego(df)
+    assert ev["resultado"].value_counts().to_dict() == {
+        "Correcto": 49, "Sin agua": 10, "Caudal insuficiente": 3}
+    insuf = ev[ev["resultado"] == "Caudal insuficiente"]
+    assert (insuf["litros"] >= 1).all() and insuf["sin_caudal"].all()
+
+
+def test_eventos_sobre_historico_recortado(df):
+    """DEF-16: armados hasta el 30/08 12:00, la orden en curso no ve el futuro."""
+    i = int(df["ts_local"].searchsorted(pd.Timestamp("2022-08-30 12:00"), side="right")) - 1
+    ultima = etl.eventos_riego(df.iloc[: i + 1]).iloc[-1]
+    assert ultima["dur_min"] == etl.situacion_actual(df, i, 15)["en_curso"]["min"]
+
+
+def test_falta_puntual_de_humedad_usa_la_ultima_lectura(df):
+    """DEF-10"""
+    s = etl.situacion_actual(df, 852, 15)
+    assert pd.isna(df["moisture"].iloc[852]) and pd.notna(s["percentil"])
+    assert etl.titular(s, 40)[0] != "sin_dato"
+
+
+def test_sin_humedad_mas_de_una_hora_es_sin_dato():
+    horas = [f"{h:02d}:{m:02d}" for h in (0, 1) for m in range(0, 60, 5)]
+    d = etl.integrar(serie("relay", [(0, h) for h in horas]),
+                     serie("litres", [(0, h) for h in horas]),
+                     serie("moisture", [(70.0, "00:00")]))
+    s = etl.situacion_actual(d, len(d) - 1, 15)
+    assert etl.titular(s, 40)[1] == "No hay lectura del suelo"

@@ -30,6 +30,9 @@ MIN_POR_REGISTRO = 5
 # Una orden de riego se considera "sin caudal" cuando el caudalimetro registra
 # menos de 0,5 L por minuto comandado. Un riego tipico ronda los 16 L/min.
 CAUDAL_MINIMO_L_MIN = 0.5
+# Por debajo de este volumen se considera que una orden no entrego agua en absoluto;
+# por encima, pero con menos de CAUDAL_MINIMO_L_MIN, entrego "caudal insuficiente".
+LITROS_SIN_AGUA = 1.0
 
 ARCHIVOS = {"relay": "D_valve.csv", "litres": "D_flowmeter.csv",
             "moisture": "D_moisture.csv"}
@@ -47,7 +50,9 @@ class DatosInvalidos(Exception):
 def cargar_serie(ruta: Path, archivo: str, columna: str) -> pd.DataFrame:
     camino = Path(ruta) / archivo
     if not camino.exists():
-        raise DatosInvalidos(f"No se encontro el archivo {archivo} en '{ruta}'.")
+        # Solo el nombre de la carpeta: la ruta absoluta del servidor no se muestra
+        raise DatosInvalidos(f"No se encontró el archivo {archivo} en la carpeta "
+                             f"«{Path(ruta).name}».")
     d = pd.read_csv(camino)
     faltan = {columna, "time_stamp"} - set(d.columns)
     if faltan:
@@ -188,7 +193,7 @@ def eventos_riego(df: pd.DataFrame) -> pd.DataFrame:
     pero el caudalimetro practicamente no registro agua.
     """
     columnas = ["inicio", "fin", "dur_min", "litros", "caudal_l_min",
-                "humedad_inicial", "percentil_inicial", "sin_caudal"]
+                "humedad_inicial", "percentil_inicial", "sin_caudal", "resultado"]
     on = df[df["relay"] == 1]
     if on.empty:
         return pd.DataFrame(columns=columnas)
@@ -201,7 +206,15 @@ def eventos_riego(df: pd.DataFrame) -> pd.DataFrame:
     ev["dur_min"] = ev["n"] * MIN_POR_REGISTRO
     ev["caudal_l_min"] = ev["litros"] / ev["dur_min"]
     ev["sin_caudal"] = ev["caudal_l_min"] < CAUDAL_MINIMO_L_MIN
+    ev["resultado"] = [resultado_riego(l, s) for l, s in zip(ev["litros"], ev["sin_caudal"])]
     return ev[columnas]
+
+
+def resultado_riego(litros: float, sin_caudal: bool) -> str:
+    """Rotulo de una orden de riego para el operario (DEF-11)."""
+    if not sin_caudal:
+        return "Correcto"
+    return "Sin agua" if litros < LITROS_SIN_AGUA else "Caudal insuficiente"
 
 
 def ordenes_sin_caudal(eventos: pd.DataFrame) -> pd.DataFrame:
@@ -230,6 +243,10 @@ def episodios_no_comandados(df: pd.DataFrame) -> pd.DataFrame:
 # Integracion A + C: lo que el tecnico necesita saber "ahora"
 # ----------------------------------------------------------------------
 
+# Minutos sin lectura de humedad a partir de los cuales se considera que el
+# sensor dejo de enviar datos
+MAX_MIN_SIN_HUMEDAD = 60
+
 # Minutos de orden abierta sin caudal a partir de los cuales se avisa
 AVISO_SIN_CAUDAL_MIN = 30
 
@@ -257,16 +274,22 @@ def situacion_actual(df: pd.DataFrame, i: int, umbral_accion: float) -> dict:
     min_sin_humedad = (float((actual["ts_local"] - df["ts_local"].loc[validas.index[-1]])
                              .total_seconds() / 60) if len(validas) else float("nan"))
 
+    # DEF-10: el sensor reporta cada ~20 min, asi que una falta puntual no es un
+    # corte. Hasta MAX_MIN_SIN_HUMEDAD se usa la ultima lectura valida.
+    percentil, humedad = actual["percentil"], actual["moisture"]
+    if pd.isna(percentil) and len(validas) and min_sin_humedad <= MAX_MIN_SIN_HUMEDAD:
+        percentil = df["percentil"].loc[validas.index[-1]]
+        humedad = validas.iloc[-1]
+
     return {
         "ts": actual["ts_local"],
-        "percentil": actual["percentil"],
-        "humedad": actual["moisture"],
+        "percentil": percentil,
+        "humedad": humedad,
         "valvula_abierta": bool(actual["relay"] == 1),
         "en_curso": en_curso,
         "litros_24h": float(normal["litros_intervalo"].sum()),
         "no_atribuida_24h": float(normal.loc[normal["relay"] == 0, "litros_intervalo"].sum()),
-        "bajo_umbral": bool(pd.notna(actual["percentil"])
-                            and actual["percentil"] < umbral_accion),
+        "bajo_umbral": bool(pd.notna(percentil) and percentil < umbral_accion),
         "corte_previo_min": float(actual["gap_min"]) if actual["post_gap"] else 0.0,
         "min_sin_humedad": min_sin_humedad,
     }
@@ -289,9 +312,12 @@ def titular(s: dict, umbral_holgura: float) -> tuple:
     """
     ec = s["en_curso"]
     if ec and ec["sin_caudal"] and ec["min"] >= AVISO_SIN_CAUDAL_MIN:
-        return ("critico", "El riego está abierto, pero no llega agua",
+        poca = ec["litros"] >= LITROS_SIN_AGUA          # DEF-11: no es lo mismo que nada
+        return ("critico",
+                "El riego está abierto, pero " + ("llega muy poca agua" if poca
+                                                  else "no llega agua"),
                 "Revisá la bomba, la llave de paso, el filtro y la electroválvula.")
-    if pd.isna(s["percentil"]) or s["min_sin_humedad"] > 60:
+    if pd.isna(s["percentil"]) or s["min_sin_humedad"] > MAX_MIN_SIN_HUMEDAD:
         return ("sin_dato", "No hay lectura del suelo",
                 "El sensor de humedad no está enviando datos. Revisá su alimentación "
                 "y la señal.")
@@ -331,7 +357,7 @@ def alertas(s: dict, umbral_fuga: float = 1000.0) -> list:
                     + " por el caudalímetro con la válvula cerrada.",
                     "Confirmar si hubo riego manual u otro sector abierto; si no, "
                     "buscar pérdidas aguas abajo del caudalímetro."))
-    if pd.isna(s["percentil"]) or s["min_sin_humedad"] > 60:
+    if pd.isna(s["percentil"]) or s["min_sin_humedad"] > MAX_MIN_SIN_HUMEDAD:
         out.append(("atencion", "Señal de telemetría pausada",
                     "No hay lectura de humedad reciente: el estado del suelo no se "
                     "puede evaluar.",
